@@ -399,6 +399,7 @@ endif()
 
 if(ARROW_GCS)
   set(ARROW_WITH_GOOGLE_CLOUD_CPP ON)
+  set(ARROW_WITH_GRPC ON)
   set(ARROW_WITH_NLOHMANN_JSON ON)
   set(ARROW_WITH_ZLIB ON)
 endif()
@@ -4944,6 +4945,11 @@ macro(build_google_cloud_cpp_storage)
   endif()
   list(APPEND GOOGLE_CLOUD_CPP_PREFIX_PATH_LIST ${CRC32C_PREFIX})
   list(APPEND GOOGLE_CLOUD_CPP_PREFIX_PATH_LIST ${NLOHMANN_JSON_PREFIX})
+  list(APPEND GOOGLE_CLOUD_CPP_PREFIX_PATH_LIST ${GRPC_PREFIX})
+  list(APPEND GOOGLE_CLOUD_CPP_PREFIX_PATH_LIST ${OPENTELEMETRY_PREFIX})
+  list(APPEND GOOGLE_CLOUD_CPP_PREFIX_PATH_LIST ${PROTOBUF_PREFIX})
+  list(APPEND GOOGLE_CLOUD_CPP_PREFIX_PATH_LIST ${CARES_PREFIX})
+  list(APPEND GOOGLE_CLOUD_CPP_PREFIX_PATH_LIST ${RE2_PREFIX})
 
   string(JOIN ${EP_LIST_SEPARATOR} GOOGLE_CLOUD_CPP_PREFIX_PATH
          ${GOOGLE_CLOUD_CPP_PREFIX_PATH_LIST})
@@ -4959,7 +4965,7 @@ macro(build_google_cloud_cpp_storage)
       # Compile only the storage library and its dependencies. To enable
       # other services (Spanner, Bigtable, etc.) add them (as a list) to this
       # parameter. Each has its own `google-cloud-cpp::*` library.
-      -DGOOGLE_CLOUD_CPP_ENABLE=storage
+      -DGOOGLE_CLOUD_CPP_ENABLE=storage,storage_grpc
       # We need this to build with OpenSSL 3.0.
       # See also: https://github.com/googleapis/google-cloud-cpp/issues/8544
       -DGOOGLE_CLOUD_CPP_ENABLE_WERROR=OFF
@@ -4978,18 +4984,74 @@ macro(build_google_cloud_cpp_storage)
   endif()
   add_dependencies(google_cloud_cpp_dependencies crc32c_ep)
   add_dependencies(google_cloud_cpp_dependencies nlohmann_json::nlohmann_json)
+  add_dependencies(google_cloud_cpp_dependencies gRPC::grpc++)
+
+  set(GOOGLE_CLOUD_CPP_BUILD_BYPRODUCTS)
 
   set(GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE
       "${GOOGLE_CLOUD_CPP_INSTALL_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}google_cloud_cpp_storage${CMAKE_STATIC_LIBRARY_SUFFIX}"
   )
+  list(APPEND GOOGLE_CLOUD_CPP_BUILD_BYPRODUCTS
+       ${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE})
+  set(GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE_GRPC
+      "${GOOGLE_CLOUD_CPP_INSTALL_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}google_cloud_cpp_storage_grpc${CMAKE_STATIC_LIBRARY_SUFFIX}"
+  )
+  list(APPEND GOOGLE_CLOUD_CPP_BUILD_BYPRODUCTS
+       ${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE_GRPC})
+
+  set(GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE_GRPC_PROTOS
+      "${GOOGLE_CLOUD_CPP_INSTALL_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}google_cloud_cpp_storage_protos${CMAKE_STATIC_LIBRARY_SUFFIX}"
+  )
+  list(APPEND GOOGLE_CLOUD_CPP_BUILD_BYPRODUCTS
+       ${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE_GRPC_PROTOS})
+
+  set(GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE_GRPC_UTILS
+      "${GOOGLE_CLOUD_CPP_INSTALL_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}google_cloud_cpp_grpc_utils${CMAKE_STATIC_LIBRARY_SUFFIX}"
+  )
+  list(APPEND GOOGLE_CLOUD_CPP_BUILD_BYPRODUCTS
+       ${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE_GRPC_UTILS})
 
   set(GOOGLE_CLOUD_CPP_STATIC_LIBRARY_REST_INTERNAL
       "${GOOGLE_CLOUD_CPP_INSTALL_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}google_cloud_cpp_rest_internal${CMAKE_STATIC_LIBRARY_SUFFIX}"
   )
+  list(APPEND GOOGLE_CLOUD_CPP_BUILD_BYPRODUCTS
+       ${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_REST_INTERNAL})
 
   set(GOOGLE_CLOUD_CPP_STATIC_LIBRARY_COMMON
       "${GOOGLE_CLOUD_CPP_INSTALL_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}google_cloud_cpp_common${CMAKE_STATIC_LIBRARY_SUFFIX}"
   )
+  list(APPEND GOOGLE_CLOUD_CPP_BUILD_BYPRODUCTS ${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_COMMON})
+
+  set(_STORAGE_PROTOS_LIBS
+      api_annotations_protos
+      api_client_protos
+      api_field_behavior_protos
+      api_http_protos
+      api_launch_stage_protos
+      api_resource_protos
+      api_routing_protos
+      iam_credentials_v1_common_protos
+      iam_credentials_v1_iamcredentials_protos
+      iam_v1_iam_policy_protos
+      iam_v1_options_protos
+      iam_v1_policy_protos
+      iam_v1_resource_policy_member_protos
+      rpc_error_details_protos
+      rpc_status_protos
+      type_date_protos
+      type_expr_protos)
+
+  foreach(_STORAGE_PROTO_LIB ${_STORAGE_PROTOS_LIBS})
+    set(_STORAGE_PROTO_STATIC_LIBRARY
+        "${GOOGLE_CLOUD_CPP_INSTALL_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}google_cloud_cpp_${_STORAGE_PROTO_LIB}${CMAKE_STATIC_LIBRARY_SUFFIX}"
+    )
+    add_library(google-cloud-cpp::${_STORAGE_PROTO_LIB} STATIC IMPORTED)
+    set_target_properties(google-cloud-cpp::${_STORAGE_PROTO_LIB}
+                          PROPERTIES IMPORTED_LOCATION ${_STORAGE_PROTO_STATIC_LIBRARY})
+    target_include_directories(google-cloud-cpp::${_STORAGE_PROTO_LIB} BEFORE
+                               INTERFACE "${GOOGLE_CLOUD_CPP_INCLUDE_DIR}")
+    list(APPEND GOOGLE_CLOUD_CPP_BUILD_BYPRODUCTS ${_STORAGE_PROTO_STATIC_LIBRARY})
+  endforeach()
 
   # Remove unused directories to save build directory storage.
   # 141MB -> 79MB
@@ -5008,9 +5070,7 @@ macro(build_google_cloud_cpp_storage)
                       URL_HASH "SHA256=${ARROW_GOOGLE_CLOUD_CPP_BUILD_SHA256_CHECKSUM}"
                       PATCH_COMMAND ${GOOGLE_CLOUD_CPP_PATCH_COMMAND}
                       CMAKE_ARGS ${GOOGLE_CLOUD_CPP_CMAKE_ARGS}
-                      BUILD_BYPRODUCTS ${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE}
-                                       ${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_REST_INTERNAL}
-                                       ${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_COMMON}
+                      BUILD_BYPRODUCTS ${GOOGLE_CLOUD_CPP_BUILD_BYPRODUCTS}
                       DEPENDS google_cloud_cpp_dependencies)
 
   # Work around https://gitlab.kitware.com/cmake/cmake/issues/15052
@@ -5078,9 +5138,67 @@ macro(build_google_cloud_cpp_storage)
                                   ZLIB::ZLIB)
   add_dependencies(google-cloud-cpp::storage google_cloud_cpp_ep)
 
+  add_library(google-cloud-cpp::storage_protos STATIC IMPORTED)
+  set_target_properties(google-cloud-cpp::storage_protos
+                        PROPERTIES IMPORTED_LOCATION
+                                   "${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE_GRPC_PROTOS}"
+  )
+  target_link_libraries(google-cloud-cpp::storage_protos
+                        INTERFACE google-cloud-cpp::api_annotations_protos
+                                  google-cloud-cpp::api_client_protos
+                                  google-cloud-cpp::api_field_behavior_protos
+                                  google-cloud-cpp::api_http_protos
+                                  google-cloud-cpp::api_launch_stage_protos
+                                  google-cloud-cpp::api_resource_protos
+                                  google-cloud-cpp::api_routing_protos
+                                  google-cloud-cpp::iam_credentials_v1_common_protos
+                                  google-cloud-cpp::iam_credentials_v1_iamcredentials_protos
+                                  google-cloud-cpp::iam_v1_iam_policy_protos
+                                  google-cloud-cpp::iam_v1_options_protos
+                                  google-cloud-cpp::iam_v1_policy_protos
+                                  google-cloud-cpp::iam_v1_resource_policy_member_protos
+                                  google-cloud-cpp::rpc_error_details_protos
+                                  google-cloud-cpp::rpc_status_protos
+                                  google-cloud-cpp::type_date_protos
+                                  google-cloud-cpp::type_expr_protos)
+  target_include_directories(google-cloud-cpp::storage_protos BEFORE
+                             INTERFACE "${GOOGLE_CLOUD_CPP_INCLUDE_DIR}")
+
+  add_library(google-cloud-cpp::grpc_utils STATIC IMPORTED)
+  set_target_properties(google-cloud-cpp::grpc_utils
+                        PROPERTIES IMPORTED_LOCATION
+                                   "${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE_GRPC_UTILS}"
+  )
+  target_include_directories(google-cloud-cpp::grpc_utils BEFORE
+                             INTERFACE "${GOOGLE_CLOUD_CPP_INCLUDE_DIR}")
+
+  add_library(google-cloud-cpp::storage_grpc STATIC IMPORTED)
+  set_target_properties(google-cloud-cpp::storage_grpc
+                        PROPERTIES IMPORTED_LOCATION
+                                   "${GOOGLE_CLOUD_CPP_STATIC_LIBRARY_STORAGE_GRPC}")
+  target_include_directories(google-cloud-cpp::storage_grpc BEFORE
+                             INTERFACE "${GOOGLE_CLOUD_CPP_INCLUDE_DIR}")
+
+  target_link_libraries(google-cloud-cpp::storage_grpc
+                        INTERFACE google-cloud-cpp::storage
+                                  google-cloud-cpp::storage_protos
+                                  google-cloud-cpp::grpc_utils
+                                  google-cloud-cpp::common
+                                  nlohmann_json::nlohmann_json
+                                  gRPC::grpc++
+                                  upb::upb
+                                  absl::optional
+                                  absl::strings
+                                  absl::time
+                                  Threads::Threads)
+  add_dependencies(google-cloud-cpp::storage_grpc google_cloud_cpp_ep)
+
   list(APPEND
        ARROW_BUNDLED_STATIC_LIBS
+       google-cloud-cpp::grpc_utils
        google-cloud-cpp::storage
+       google-cloud-cpp::storage_protos
+       google-cloud-cpp::storage_grpc
        google-cloud-cpp::rest-internal
        google-cloud-cpp::common)
   if(ABSL_VENDORED)

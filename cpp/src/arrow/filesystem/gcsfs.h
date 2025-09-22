@@ -90,6 +90,8 @@ struct ARROW_EXPORT GcsOptions {
   /// that create new buckets need a project id.
   std::optional<std::string> project_id;
 
+  bool use_grpc = false;
+
   bool Equals(const GcsOptions& other) const;
 
   /// \brief Initialize with Google Default Credentials

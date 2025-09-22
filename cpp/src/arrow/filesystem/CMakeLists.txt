@@ -47,7 +47,8 @@ if(ARROW_GCS)
                  EXTRA_LABELS
                  filesystem
                  EXTRA_LINK_LIBS
-                 google-cloud-cpp::storage)
+                 google-cloud-cpp::storage
+                 google-cloud-cpp::storage_grpc)
 endif()
 
 if(ARROW_AZURE)

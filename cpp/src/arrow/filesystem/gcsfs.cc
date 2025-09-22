@@ -17,7 +17,9 @@
 
 #include "arrow/filesystem/gcsfs.h"
 
+#include <google/cloud/storage/async/client.h>
 #include <google/cloud/storage/client.h>
+#include <google/cloud/storage/grpc_plugin.h>
 #include <algorithm>
 #include <chrono>
 
@@ -49,6 +51,7 @@ bool GcsCredentials::Equals(const GcsCredentials& other) const {
 namespace {
 
 namespace gcs = google::cloud::storage;
+namespace gcse = google::cloud::storage_experimental;
 using GcsCode = google::cloud::StatusCode;
 using GcsStatus = google::cloud::Status;
 
@@ -174,6 +177,101 @@ class GcsInputStream : public arrow::io::InputStream {
 
  private:
   mutable gcs::ObjectReadStream stream_;
+  GcsPath path_;
+  gcs::Generation generation_;
+  gcs::Client client_;
+  int64_t nread_ = 0;  // Total bytes consumed (updated after each Read())
+  bool closed_ = false;
+};
+
+class GcsBidiInputStream : public GcsInputStream {
+ public:
+  explicit GcsBidiInputStream(gcse::ObjectDescriptor& descriptor, GcsPath path,
+                              gcs::Generation generation, gcs::Client client)
+      : GcsInputStream(gcs::ObjectReadStream(), path, generation, client),
+        descriptor_(std::move(descriptor)) {}
+
+  ~GcsBidiInputStream() override = default;
+
+  //@{
+  // @name FileInterface
+  Status Close() override {
+    descriptor_.~ObjectDescriptor();
+    closed_ = true;
+    return Status::OK();
+  }
+
+  Result<int64_t> Tell() const override { return nread_; }
+
+  bool closed() const override { return closed_; }
+  //@}
+
+  //@{
+  // @name Readable
+  Result<int64_t> Read(int64_t nbytes, void* out) override {
+    if (closed()) return Status::Invalid("Cannot read from a closed stream");
+    gcse::AsyncReader reader;
+    gcse::AsyncToken token;
+    gcse::ReadPayload payload;
+    std::tie(reader, token) = descriptor_.Read(nread_, nbytes);
+    auto read = reader.Read(std::move(token)).get();
+    ARROW_GCS_RETURN_NOT_OK(read.status());
+
+    payload = std::move(read.value().first);
+    std::string contents = std::string{};
+    for (auto c : payload.contents()) contents += std::string(c);
+    memcpy(out, contents.c_str(), payload.size());
+    nread_ += payload.size();
+    return nread_;
+  }
+
+  Result<std::shared_ptr<Buffer>> Read(int64_t nbytes) override {
+    if (closed()) return Status::Invalid("Cannot read from a closed stream");
+    ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::AllocateResizableBuffer(nbytes));
+    ARROW_ASSIGN_OR_RAISE(int64_t read,
+                          Read(nbytes, reinterpret_cast<char*>(buffer->mutable_data())));
+    RETURN_NOT_OK(buffer->Resize(read, true));
+    return std::shared_ptr<Buffer>(std::move(buffer));
+  }
+  //@}
+
+  //@{
+  // @name InputStream
+  Result<std::shared_ptr<const KeyValueMetadata>> ReadMetadata() override {
+    auto metadata = client_.GetObjectMetadata(path_.bucket, path_.object, generation_);
+    ARROW_GCS_RETURN_NOT_OK(metadata.status());
+    return internal::FromObjectMetadata(*metadata);
+  }
+  //@}
+
+  Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) {
+    if (closed()) return Status::Invalid("Cannot read from closed file");
+    gcse::AsyncReader reader;
+    gcse::AsyncToken token;
+    gcse::ReadPayload payload;
+    std::tie(reader, token) = descriptor_.Read(position, nbytes);
+    auto read = reader.Read(std::move(token)).get();
+    ARROW_GCS_RETURN_NOT_OK(read.status());
+
+    payload = std::move(read.value().first);
+    std::string contents = std::string{};
+    for (auto c : payload.contents()) contents += std::string(c);
+    memcpy(out, contents.c_str(), payload.size());
+    return payload.size();
+  }
+
+  Result<std::shared_ptr<Buffer>> ReadAt(int64_t position, int64_t nbytes) {
+    if (closed()) return Status::Invalid("Cannot read from closed file");
+    ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::AllocateResizableBuffer(nbytes));
+    ARROW_ASSIGN_OR_RAISE(
+        auto read,
+        ReadAt(position, nbytes, reinterpret_cast<char*>(buffer->mutable_data())));
+    RETURN_NOT_OK(buffer->Resize(read, true));
+    return buffer;
+  }
+
+ private:
+  gcse::ObjectDescriptor descriptor_;
   GcsPath path_;
   gcs::Generation generation_;
   gcs::Client client_;
@@ -329,12 +427,72 @@ class GcsRandomAccessFile : public arrow::io::RandomAccessFile {
   std::shared_ptr<GcsInputStream> mutable stream_;
 };
 
+class GcsBidiRandomAccessFile : public arrow::io::RandomAccessFile {
+ public:
+  GcsBidiRandomAccessFile(std::shared_ptr<GcsBidiInputStream> stream) : stream_(stream) {}
+  ~GcsBidiRandomAccessFile() override = default;
+
+  //@{
+  // @name FileInterface
+  Status Close() override { return stream_->Close(); }
+  Status Abort() override { return stream_->Abort(); }
+  Result<int64_t> Tell() const override { return stream_->Tell(); }
+  bool closed() const override { return stream_->closed(); }
+  //@}
+
+  //@{
+  // @name Readable
+  Result<int64_t> Read(int64_t nbytes, void* out) override {
+    return stream_->Read(nbytes, out);
+  }
+  Result<std::shared_ptr<Buffer>> Read(int64_t nbytes) override {
+    return stream_->Read(nbytes);
+  }
+  //@}
+
+  //@{
+  // @name InputStream
+  Result<std::shared_ptr<const KeyValueMetadata>> ReadMetadata() override {
+    return stream_->ReadMetadata();
+  }
+  //@}
+
+  //@{
+  // @name RandomAccessFile
+  Result<int64_t> GetSize() override { return 1; }
+
+  Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) override {
+    if (closed()) return Status::Invalid("Cannot read from closed file");
+    return stream_->ReadAt(position, nbytes, out);
+  }
+  Result<std::shared_ptr<Buffer>> ReadAt(int64_t position, int64_t nbytes) override {
+    if (closed()) return Status::Invalid("Cannot read from closed file");
+    return stream_->ReadAt(position, nbytes);
+  }
+  //@}
+
+  // from Seekable
+  Status Seek(int64_t position) override {
+    if (closed()) return Status::Invalid("Cannot seek in a closed file");
+    return Status::OK();
+  }
+
+ private:
+  std::shared_ptr<GcsBidiInputStream> stream_;
+};
+
 }  // namespace
 
 class GcsFileSystem::Impl {
  public:
   explicit Impl(GcsOptions o)
-      : options_(std::move(o)), client_(internal::AsGoogleCloudOptions(options_)) {}
+      : options_(std::move(o)),
+        client_(options_.use_grpc
+                    ? gcs::Client(internal::AsGoogleCloudOptions(options_))
+                    : gcs::MakeGrpcClient(internal::AsGoogleCloudOptions(options_))),
+        bidi_client_(options_.use_grpc
+                         ? std::make_optional<gcse::AsyncClient>(gcse::AsyncClient())
+                         : std::nullopt) {}
 
   const GcsOptions& options() const { return options_; }
 
@@ -608,9 +766,19 @@ class GcsFileSystem::Impl {
                                                           gcs::Generation generation,
                                                           gcs::ReadRange range,
                                                           gcs::ReadFromOffset offset) {
-    auto stream = client_.ReadObject(path.bucket, path.object, generation, range, offset);
-    ARROW_GCS_RETURN_NOT_OK(stream.status());
-    return std::make_shared<GcsInputStream>(std::move(stream), path, generation, client_);
+    if (options_.use_grpc) {
+      auto descriptor =
+          bidi_client_->Open(gcse::BucketName(path.bucket), path.object).get();
+      ARROW_GCS_RETURN_NOT_OK(descriptor.status());
+      return std::make_shared<GcsBidiInputStream>(descriptor.value(), path, generation,
+                                                  client_);
+    } else {
+      auto stream =
+          client_.ReadObject(path.bucket, path.object, generation, range, offset);
+      ARROW_GCS_RETURN_NOT_OK(stream.status());
+      return std::make_shared<GcsInputStream>(std::move(stream), path, generation,
+                                              client_);
+    }
   }
 
   Result<std::shared_ptr<GcsOutputStream>> OpenOutputStream(
@@ -699,6 +867,7 @@ class GcsFileSystem::Impl {
 
   GcsOptions options_;
   gcs::Client client_;
+  std::optional<gcse::AsyncClient> bidi_client_;
 };
 
 GcsOptions::GcsOptions() {
@@ -927,13 +1096,22 @@ Result<std::shared_ptr<io::RandomAccessFile>> GcsFileSystem::OpenInputFile(
   ARROW_ASSIGN_OR_RAISE(auto p, GcsPath::FromString(path));
   auto metadata = impl_->GetObjectMetadata(p);
   ARROW_GCS_RETURN_NOT_OK(metadata.status());
-  auto open_stream = [impl = impl_, p](gcs::Generation g, gcs::ReadRange range,
-                                       gcs::ReadFromOffset offset) {
-    return impl->OpenInputStream(p, g, range, offset);
-  };
+  if (impl_->options().use_grpc) {
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<GcsInputStream> str,
+                          impl_->OpenInputStream(p, gcs::Generation(), gcs::ReadRange(),
+                                                 gcs::ReadFromOffset()));
+    std::shared_ptr<GcsBidiInputStream> stream =
+        std::static_pointer_cast<GcsBidiInputStream>(str);
+    return std::make_shared<GcsBidiRandomAccessFile>(stream);
+  } else {
+    auto open_stream = [impl = impl_, p](gcs::Generation g, gcs::ReadRange range,
+                                         gcs::ReadFromOffset offset) {
+      return impl->OpenInputStream(p, g, range, offset);
+    };
 
-  return std::make_shared<GcsRandomAccessFile>(std::move(open_stream),
-                                               *std::move(metadata));
+    return std::make_shared<GcsRandomAccessFile>(std::move(open_stream),
+                                                 *std::move(metadata));
+  }
 }
 
 Result<std::shared_ptr<io::RandomAccessFile>> GcsFileSystem::OpenInputFile(
@@ -946,12 +1124,21 @@ Result<std::shared_ptr<io::RandomAccessFile>> GcsFileSystem::OpenInputFile(
   ARROW_ASSIGN_OR_RAISE(auto p, GcsPath::FromString(info.path()));
   auto metadata = impl_->GetObjectMetadata(p);
   ARROW_GCS_RETURN_NOT_OK(metadata.status());
-  auto open_stream = [impl = impl_, p](gcs::Generation g, gcs::ReadRange range,
-                                       gcs::ReadFromOffset offset) {
-    return impl->OpenInputStream(p, g, range, offset);
-  };
-  return std::make_shared<GcsRandomAccessFile>(std::move(open_stream),
-                                               *std::move(metadata));
+  if (impl_->options().use_grpc) {
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<GcsInputStream> str,
+                          impl_->OpenInputStream(p, gcs::Generation(), gcs::ReadRange(),
+                                                 gcs::ReadFromOffset()));
+    std::shared_ptr<GcsBidiInputStream> stream =
+        std::static_pointer_cast<GcsBidiInputStream>(str);
+    return std::make_shared<GcsBidiRandomAccessFile>(stream);
+  } else {
+    auto open_stream = [impl = impl_, p](gcs::Generation g, gcs::ReadRange range,
+                                         gcs::ReadFromOffset offset) {
+      return impl->OpenInputStream(p, g, range, offset);
+    };
+    return std::make_shared<GcsRandomAccessFile>(std::move(open_stream),
+                                                 *std::move(metadata));
+  }
 }
 
 Result<std::shared_ptr<io::OutputStream>> GcsFileSystem::OpenOutputStream(
