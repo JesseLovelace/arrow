@@ -923,7 +923,9 @@ if(ARROW_FILESYSTEM)
   endif()
   if(ARROW_GCS)
     foreach(ARROW_FILESYSTEM_TARGET ${ARROW_FILESYSTEM_TARGETS})
-      target_link_libraries(${ARROW_FILESYSTEM_TARGET} PRIVATE google-cloud-cpp::storage)
+      target_link_libraries(${ARROW_FILESYSTEM_TARGET}
+                            PRIVATE google-cloud-cpp::storage
+                                    google-cloud-cpp::storage_grpc)
     endforeach()
   endif()
   if(ARROW_HDFS)
